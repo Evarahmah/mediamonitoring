@@ -421,417 +421,359 @@ def gdelt_search(query, start, end, max_records=250):
     return df
 
 
-# ---------------------------------------------------------------- UI
-st.set_page_config(page_title="Media Screening — Energy Sovereignty", layout="wide")
+# ================================================================ UI (guided)
+st.set_page_config(page_title="Pemantau Framing Media", layout="centered")
 init_db()
 
-st.title("Media Screening: Energy Sovereignty & Cost of Delayed Transition")
-st.caption(f"Periode analisis: {PERIOD_START} s.d. {PERIOD_END} · Codebook {CODEBOOK_VERSION}")
+# ---- CSS ringan untuk merapikan tampilan ----
+st.markdown("""
+<style>
+  .block-container {max-width: 900px; padding-top: 2rem;}
+  div[data-testid="stMetricValue"] {font-size: 1.4rem;}
+  .step-done {color: #1D9E75;}
+  .doc-card {border: 1px solid #E0E0E0; border-radius: 12px; padding: 1rem 1.25rem; margin: .5rem 0;}
+  .muted {color: #6b7280; font-size: 0.9rem;}
+</style>
+""", unsafe_allow_html=True)
 
-with st.sidebar:
-    st.header("Identitas")
-    coder_name = st.text_input("Nama coder / analis", key="coder_name",
-                               help="Wajib diisi — masuk ke audit trail")
-    st.divider()
+
+def _stats():
     d = docs_df()
-    st.metric("Total dokumen", len(d))
-    st.metric("Included", int((d["status"] == "included").sum()) if len(d) else 0)
-    st.metric("Pending screening", int((d["status"] == "pending").sum()) if len(d) else 0)
     cds = codings_df()
-    st.metric("Dokumen sudah dikoding", cds["doc_id"].nunique() if len(cds) else 0)
+    total = len(d)
+    pending = int((d["status"] == "pending").sum()) if total else 0
+    included = int((d["status"] == "included").sum()) if total else 0
+    coded = cds["doc_id"].nunique() if len(cds) else 0
+    return d, cds, total, pending, included, coded
 
-tab_import, tab_screen, tab_code, tab_dash, tab_rel, tab_export = st.tabs(
-    ["📥 Import & GDELT", "🔍 Screening", "✍️ Coding", "📊 Dashboard", "✅ Reliability", "📤 Export & Audit"])
 
-# ================================================================ IMPORT
-with tab_import:
-    col1, col2 = st.columns(2)
+d, cds, total, pending, included, coded = _stats()
 
-    with col1:
-        st.subheader("Import CSV (hasil Manual Google Search)")
-        st.caption("Kolom minimal: title, url, pub_date (YYYY-MM-DD), source, doc_type, actor_group, query_used")
-        f = st.file_uploader("Upload CSV", type=["csv"])
-        method_csv = st.selectbox("Search method", SEARCH_METHODS, index=0)
+# ---- Sidebar: identitas + progres ringkas ----
+with st.sidebar:
+    st.markdown("### Siapa Anda?")
+    coder_name = st.text_input("Nama Anda", key="coder_name",
+                               placeholder="mis. Eva",
+                               help="Dipakai untuk mencatat siapa mengerjakan apa")
+    if not coder_name:
+        st.info("Isi nama dulu untuk mulai.")
+    st.divider()
+    st.markdown("### Progres")
+    if total == 0:
+        st.caption("Belum ada dokumen. Mulai dari langkah 1.")
+    else:
+        st.progress(min(1.0, (included + (total - pending - included)) / total),
+                    text=f"{total - pending}/{total} sudah disaring")
+        if included:
+            st.progress(min(1.0, coded / included),
+                        text=f"{coded}/{included} sudah dibaca & ditandai")
+    st.divider()
+    st.caption(f"Periode: {PERIOD_START.strftime('%b %Y')}–{PERIOD_END.strftime('%b %Y')}")
+
+# ---- Header + navigasi langkah (bukan tab penuh istilah) ----
+st.title("Pemantau Framing Media Energi")
+
+STEPS = {
+    "1. Masukkan data": "import",
+    "2. Saring dokumen": "screen",
+    "3. Baca & tandai": "code",
+    "4. Lihat hasil": "dash",
+    "Lainnya (audit, keandalan)": "more",
+}
+labels = list(STEPS.keys())
+# tandai langkah yang sudah ada isinya
+if total: labels[0] += "  ✓"
+if (total - pending) > 0: labels[1] += "  ✓"
+if coded > 0: labels[2] += "  ✓"
+
+choice = st.radio("Langkah", labels, horizontal=False, label_visibility="collapsed")
+page = STEPS[choice.replace("  ✓", "")]
+st.divider()
+
+# ============================================================ 1. IMPORT
+if page == "import":
+    st.header("Langkah 1 — Masukkan data")
+    st.markdown("Punya file hasil pencarian (CSV dari SerpApi/Google)? Upload di sini. "
+                "Kolom jenis dokumen & kelompok aktor boleh kosong — sistem menebaknya otomatis, "
+                "Anda tinggal cek di langkah 2.")
+
+    if not coder_name:
+        st.warning("Isi nama Anda di panel kiri dulu.")
+    else:
+        f = st.file_uploader("Pilih file CSV", type=["csv"])
         if f is not None:
             try:
                 imp = pd.read_csv(f)
             except Exception:
-                f.seek(0)
-                imp = pd.read_csv(f, sep=";")
-            st.dataframe(imp.head(10), use_container_width=True)
-            # pemetaan kolom fleksibel
+                f.seek(0); imp = pd.read_csv(f, sep=";")
+            st.success(f"File terbaca: {len(imp)} baris.")
+            with st.expander("Lihat cuplikan data"):
+                st.dataframe(imp.head(8), use_container_width=True)
             cols = list(imp.columns)
-            mapping = {}
-            for target in ["title", "url", "pub_date", "source", "doc_type", "actor_group", "query_used"]:
-                guess = next((c for c in cols if c.strip().lower().replace(" ", "_") == target), None)
-                mapping[target] = st.selectbox(f"Kolom untuk `{target}`", ["(kosong)"] + cols,
-                                               index=(cols.index(guess) + 1) if guess in cols else 0,
-                                               key=f"map_{target}")
-            if st.button("Import ke database", type="primary", disabled=not coder_name):
-                added, dup_flagged = 0, 0
+
+            def guess(name):
+                g = next((c for c in cols if c.strip().lower().replace(" ", "_") == name), None)
+                return (cols.index(g) + 1) if g in cols else 0
+
+            with st.expander("Cocokkan kolom (biasanya sudah benar otomatis)", expanded=False):
+                mapping = {}
+                for tgt in ["title", "url", "pub_date", "source", "doc_type", "actor_group", "query_used"]:
+                    mapping[tgt] = st.selectbox(tgt, ["(kosong)"] + cols, index=guess(tgt), key=f"map_{tgt}")
+            method = st.selectbox("Sumber data ini dari mana?", SEARCH_METHODS, index=1)
+            if st.button("Masukkan ke sistem", type="primary"):
+                added, dup = 0, 0
                 for _, r in imp.iterrows():
                     row = {t: (r[mapping[t]] if mapping[t] != "(kosong)" else None) for t in mapping}
-                    row["search_method"] = method_csv
+                    row["search_method"] = method
                     _, dups = add_document(row, actor=coder_name)
-                    added += 1
-                    dup_flagged += 1 if dups else 0
-                st.success(f"{added} dokumen diimpor; {dup_flagged} ditandai kandidat duplikat (cek tab Screening).")
-        if not coder_name:
-            st.info("Isi nama coder di sidebar dulu sebelum import.")
+                    added += 1; dup += 1 if dups else 0
+                st.success(f"{added} dokumen masuk. {dup} kemungkinan duplikat ditandai untuk dicek.")
+                st.balloons()
 
         st.divider()
-        st.subheader("Entri manual (media berlangganan / dokumen tunggal)")
-        with st.form("manual_entry", clear_on_submit=True):
-            m_title = st.text_input("Judul")
-            m_url = st.text_input("URL")
-            m_date = st.date_input("Tanggal publikasi", value=None,
-                                   min_value=date(2025, 1, 1), max_value=date(2026, 12, 31))
-            m_source = st.text_input("Media / institusi")
-            m_type = st.selectbox("Jenis dokumen", DOC_TYPES)
-            m_group = st.selectbox("Actor group", ACTOR_GROUPS)
-            m_query = st.text_input("Query / cara ditemukan")
-            m_method = st.selectbox("Search method", SEARCH_METHODS, index=3)
-            if st.form_submit_button("Tambah dokumen") and m_title and coder_name:
-                _, dups = add_document({
-                    "title": m_title, "url": m_url,
-                    "pub_date": str(m_date) if m_date else None,
-                    "source": m_source, "doc_type": m_type, "actor_group": m_group,
-                    "query_used": m_query, "search_method": m_method}, actor=coder_name)
-                if dups:
-                    st.warning(f"Ditambahkan, tapi mirip dengan dokumen id={dups[0][0]} ({dups[0][2]}).")
-                else:
-                    st.success("Dokumen ditambahkan.")
+        with st.expander("Atau tambah satu dokumen manual (mis. dari media langganan)"):
+            with st.form("manual", clear_on_submit=True):
+                mt = st.text_input("Judul")
+                mu = st.text_input("Link (URL)")
+                mdt = st.date_input("Tanggal terbit", value=None,
+                                    min_value=date(2025, 1, 1), max_value=date(2026, 12, 31))
+                msrc = st.text_input("Nama media / lembaga")
+                if st.form_submit_button("Tambah") and mt and coder_name:
+                    add_document({"title": mt, "url": mu, "pub_date": str(mdt) if mdt else None,
+                                  "source": msrc, "doc_type": None, "actor_group": None,
+                                  "query_used": "manual", "search_method": "Manual (lainnya)"}, actor=coder_name)
+                    st.success("Ditambahkan.")
 
-    with col2:
-        st.subheader("GDELT DOC API (supplementary)")
-        st.caption("GDELT DOC 2.0 paling andal untuk ±3 bulan terakhir. Gunakan untuk melengkapi "
-                   "akhir April–Juli 2026, bukan sumber tunggal Januari–Juli.")
-        qname = st.selectbox("Query template", list(DEFAULT_QUERIES.keys()))
-        gq = st.text_area("Query GDELT (bisa diedit)", value=DEFAULT_QUERIES[qname].split(" after:")[0],
-                          height=120,
-                          help="GDELT tidak memakai after:/before: — rentang tanggal diatur di bawah. "
-                               "Tambahkan sourcelang:ind untuk membatasi bahasa Indonesia.")
-        gc1, gc2 = st.columns(2)
-        g_start = gc1.date_input("Dari", value=date(2026, 4, 20))
-        g_end = gc2.date_input("Sampai", value=date(2026, 7, 20))
-        g_max = st.slider("Max records", 50, 250, 250, 50)
-        g_id_only = st.checkbox(
-            "Batasi ke Indonesia (tambahkan sourcecountry:indonesia sourcelang:ind)", value=True,
-            help="sourcecountry memfilter berdasarkan NEGARA OUTLET (kompas.com, antaranews.com, dst.), "
-                 "sourcelang berdasarkan bahasa artikel. Nonaktifkan sourcelang jika ingin ikut menangkap "
-                 "outlet Indonesia berbahasa Inggris (The Jakarta Post) — lihat tombol di bawah.")
-        g_en_pass = st.checkbox(
-            "Pass tambahan: outlet Indonesia berbahasa Inggris (sourcecountry:indonesia sourcelang:eng)",
-            value=False)
-        if st.button("Cari di GDELT"):
-            try:
-                queries_to_run = []
-                if g_id_only:
-                    queries_to_run.append(gq + " sourcecountry:indonesia sourcelang:ind")
-                else:
-                    queries_to_run.append(gq)
-                if g_en_pass:
-                    queries_to_run.append(gq + " sourcecountry:indonesia sourcelang:eng")
-                parts = [gdelt_search(q, g_start, g_end, g_max) for q in queries_to_run]
-                res = pd.concat([p for p in parts if not p.empty], ignore_index=True) \
-                    if any(not p.empty for p in parts) else pd.DataFrame()
-                if res.empty:
-                    st.info("Tidak ada hasil.")
-                else:
-                    res = res.drop_duplicates(subset=["url"]).reset_index(drop=True)
-                    st.session_state["gdelt_results"] = res
-                    st.success(f"{len(res)} artikel ditemukan (setelah dedup URL).")
-            except Exception as e:
-                st.error(f"Gagal memanggil GDELT: {e}")
-        if "gdelt_results" in st.session_state:
-            res = st.session_state["gdelt_results"]
-            st.dataframe(res, use_container_width=True, height=300)
-            g_group = st.selectbox("Actor group untuk hasil ini",
-                                   ["Auto (dari URL/judul)"] + ACTOR_GROUPS, index=0)
-            g_type = st.selectbox("Jenis dokumen default",
-                                  ["Auto (dari URL/judul)"] + DOC_TYPES, index=0)
-            sel = st.multiselect("Pilih baris untuk diimpor (index)", res.index.tolist())
-            if st.button("Import baris terpilih", disabled=not coder_name):
-                n_dup = 0
-                for i in sel:
-                    r = res.loc[i]
-                    _, dups = add_document({
-                        "title": r["title"], "url": r["url"], "pub_date": r["pub_date"],
-                        "source": r["source"], "doc_type": g_type, "actor_group": g_group,
-                        "query_used": gq, "search_method": "GDELT DOC API"}, actor=coder_name)
-                    n_dup += 1 if dups else 0
-                st.success(f"{len(sel)} diimpor; {n_dup} kandidat duplikat ditandai.")
+# ============================================================ 2. SCREEN
+elif page == "screen":
+    st.header("Langkah 2 — Saring dokumen")
+    st.markdown("Untuk tiap dokumen: apakah layak masuk analisis? Cek juga apakah kelompok "
+                "aktornya sudah benar (yang ditebak sistem).")
 
-# ================================================================ SCREENING
-with tab_screen:
-    st.subheader("Screening: inklusi / eksklusi")
-    d = docs_df()
-    if d.empty:
-        st.info("Belum ada dokumen.")
+    if pending == 0 and total > 0:
+        st.success("Semua dokumen sudah disaring. Lanjut ke langkah 3.")
+    elif total == 0:
+        st.info("Belum ada dokumen. Kembali ke langkah 1.")
+    elif not coder_name:
+        st.warning("Isi nama Anda di panel kiri dulu.")
     else:
-        fstatus = st.multiselect("Filter status", ["pending", "included", "excluded"], default=["pending"])
-        view = d[d["status"].isin(fstatus)].copy()
-        st.caption(f"{len(view)} dokumen. Kolom **dup_of** berisi id dokumen yang terdeteksi mirip.")
-        st.dataframe(view[["id", "title", "source", "pub_date", "actor_group", "doc_type",
-                           "auto_rule", "search_method", "status", "dup_of"]],
-                     use_container_width=True, height=320)
-        if len(view):
-            sel_id = st.number_input("ID dokumen untuk di-screen", min_value=int(d["id"].min()),
-                                     max_value=int(d["id"].max()), step=1)
-            row = d[d["id"] == sel_id]
-            if len(row):
-                r = row.iloc[0]
-                st.markdown(f"**{r['title']}**  \n{r['source'] or '-'} · {r['pub_date'] or '-'} · "
-                            f"[{r['url']}]({r['url']})")
-                if r.get("auto_rule"):
-                    st.info(f"Klasifikasi otomatis → **{r['actor_group']} / {r['doc_type']}** "
-                            f"({r['auto_rule']}). Konfirmasi atau override di bawah.")
-                oc1, oc2, oc3 = st.columns([1, 2, 1])
-                new_group = oc1.selectbox("Actor group", ACTOR_GROUPS,
-                                          index=ACTOR_GROUPS.index(r["actor_group"])
-                                          if r["actor_group"] in ACTOR_GROUPS else 1,
-                                          key=f"ovr_g_{sel_id}")
-                new_type = oc2.selectbox("Jenis dokumen", DOC_TYPES,
-                                         index=DOC_TYPES.index(r["doc_type"])
-                                         if r["doc_type"] in DOC_TYPES else 0,
-                                         key=f"ovr_t_{sel_id}")
-                if oc3.button("Simpan klasifikasi", disabled=not coder_name):
-                    with get_conn() as c:
-                        c.execute("UPDATE documents SET actor_group=?, doc_type=?, "
-                                  "auto_rule=COALESCE(auto_rule,'') || ' | dikonfirmasi ' || ? WHERE id=?",
-                                  (new_group, new_type, coder_name, int(sel_id)))
-                    log_action(coder_name, "reclassify",
-                               f"id={sel_id} → {new_group}/{new_type}")
-                    st.success("Klasifikasi diperbarui."); st.rerun()
-                # cek kriteria otomatis
-                warns = []
-                try:
-                    pd_ = pd.to_datetime(r["pub_date"]).date()
-                    if not (PERIOD_START <= pd_ <= PERIOD_END):
-                        warns.append("Tanggal publikasi di luar Jan–Jul 2026")
-                except Exception:
-                    warns.append("Tanggal publikasi kosong / tidak valid")
-                if r["dup_of"] and not pd.isna(r["dup_of"]):
-                    warns.append(f"Kandidat duplikat dari dokumen id={int(r['dup_of'])} — "
-                                 "hitung satu, kecuali framing editorial berbeda")
-                for w in warns:
-                    st.warning(w)
-                cA, cB = st.columns(2)
-                with cA:
-                    st.markdown("**Checklist inklusi** — semua harus terpenuhi:")
-                    ok1 = st.checkbox("Terbit 1 Jan – 31 Jul 2026")
-                    ok2 = st.checkbox("Relevan dengan Indonesia / kebijakan energi Indonesia")
-                    ok3 = st.checkbox("Membahas ≥1 objective secara substantif (bukan incidental)")
-                    ok4 = st.checkbox("Open access / langganan resmi IESR, bisa diverifikasi")
-                    note = st.text_input("Catatan screening", key="scr_note")
-                    if st.button("✔ Include", type="primary",
-                                 disabled=not (ok1 and ok2 and ok3 and ok4 and coder_name)):
-                        with get_conn() as c:
-                            c.execute("UPDATE documents SET status='included', screen_notes=? WHERE id=?",
-                                      (note, int(sel_id)))
-                        log_action(coder_name, "include", f"id={sel_id}")
-                        st.success("Included."); st.rerun()
-                with cB:
-                    reason = st.selectbox("Alasan eksklusi", EXCLUSION_REASONS)
-                    if st.button("✘ Exclude", disabled=not coder_name):
-                        with get_conn() as c:
-                            c.execute("UPDATE documents SET status='excluded', exclusion_reason=?, "
-                                      "screen_notes=? WHERE id=?", (reason, note if 'note' in dir() else "", int(sel_id)))
-                        log_action(coder_name, "exclude", f"id={sel_id} reason={reason}")
-                        st.success("Excluded."); st.rerun()
+        pend = d[d["status"] == "pending"].sort_values("id")
+        st.caption(f"Sisa {len(pend)} dokumen untuk disaring.")
+        r = pend.iloc[0]  # tangani satu per satu, paling atas
+        st.markdown(f"#### {r['title']}")
+        meta = f"{r['source'] or '—'} · {r['pub_date'] or 'tanggal?'}"
+        st.markdown(f"<span class='muted'>{meta}</span>", unsafe_allow_html=True)
+        if r["url"] and str(r["url"]) != "nan":
+            st.markdown(f"[Buka artikel untuk dibaca →]({r['url']})")
 
-# ================================================================ CODING
-with tab_code:
-    st.subheader("Coding dokumen (status: included)")
-    d = docs_df()
-    cds = codings_df()
+        # peringatan otomatis
+        warns = []
+        try:
+            pdd = pd.to_datetime(r["pub_date"]).date()
+            if not (PERIOD_START <= pdd <= PERIOD_END):
+                warns.append("Tanggal di luar periode Jan–Jul 2026")
+        except Exception:
+            warns.append("Tanggal kosong / tak jelas — cek manual saat buka artikel")
+        if r["dup_of"] and not pd.isna(r["dup_of"]):
+            warns.append(f"Mirip dengan dokumen #{int(r['dup_of'])} — hitung satu saja kecuali isinya beda")
+        for w in warns:
+            st.warning(w, icon="⚠️")
+
+        st.markdown("**Kelompok aktor** (tebakan sistem — betulkan bila salah):")
+        if r.get("auto_rule"):
+            st.caption(f"↳ {r['auto_rule']}")
+        c1, c2 = st.columns(2)
+        ng = c1.selectbox("Kelompok", ACTOR_GROUPS,
+                          index=ACTOR_GROUPS.index(r["actor_group"]) if r["actor_group"] in ACTOR_GROUPS else 1)
+        nt = c2.selectbox("Jenis dokumen", DOC_TYPES,
+                          index=DOC_TYPES.index(r["doc_type"]) if r["doc_type"] in DOC_TYPES else 0)
+
+        st.markdown("**Layak masuk analisis?**")
+        st.caption("Layak jika: terbit Jan–Jul 2026 · soal energi Indonesia · membahas kedaulatan "
+                   "energi atau biaya penundaan secara serius (bukan sekadar menyebut).")
+        b1, b2, _ = st.columns([1, 1, 2])
+        if b1.button("✓ Ya, masukkan", type="primary"):
+            with get_conn() as c:
+                c.execute("UPDATE documents SET status='included', actor_group=?, doc_type=? WHERE id=?",
+                          (ng, nt, int(r["id"])))
+            log_action(coder_name, "include", f"id={r['id']} {ng}/{nt}")
+            st.rerun()
+        with b2.popover("✗ Tidak"):
+            reason = st.selectbox("Alasan", EXCLUSION_REASONS, key=f"excl_{r['id']}")
+            if st.button("Keluarkan", key=f"exb_{r['id']}"):
+                with get_conn() as c:
+                    c.execute("UPDATE documents SET status='excluded', exclusion_reason=? WHERE id=?",
+                              (reason, int(r["id"])))
+                log_action(coder_name, "exclude", f"id={r['id']} {reason}")
+                st.rerun()
+
+# ============================================================ 3. CODE
+elif page == "code":
+    st.header("Langkah 3 — Baca & tandai framing")
     inc = d[d["status"] == "included"]
-    if inc.empty:
-        st.info("Belum ada dokumen berstatus included.")
-    else:
-        coded_ids = set(cds["doc_id"]) if len(cds) else set()
-        mode = st.radio("Mode", ["Belum dikoding", "Double-coding (dokumen sudah dikoding coder lain)", "Semua"],
-                        horizontal=True)
-        if mode == "Belum dikoding":
-            pool = inc[~inc["id"].isin(coded_ids)]
-        elif mode.startswith("Double"):
-            pool = inc[inc["id"].isin(coded_ids)]
-        else:
-            pool = inc
-        st.dataframe(pool[["id", "title", "source", "pub_date", "actor_group"]],
-                     use_container_width=True, height=240)
-        if len(pool):
-            cid = st.number_input("ID dokumen untuk dikoding", min_value=int(inc["id"].min()),
-                                  max_value=int(inc["id"].max()), step=1, key="code_id")
-            row = inc[inc["id"] == cid]
-            if len(row):
-                r = row.iloc[0]
-                prev = cds[cds["doc_id"] == cid] if len(cds) else pd.DataFrame()
-                st.markdown(f"**{r['title']}** — {r['actor_group']} · {r['source'] or '-'} · "
-                            f"[{r['url']}]({r['url']})")
-                if len(prev):
-                    st.caption(f"Sudah dikoding oleh: {', '.join(prev['coder'].unique())} "
-                               "(isi coding kamu secara independen — jangan lihat hasil mereka dulu).")
-                with st.form("coding_form", clear_on_submit=True):
-                    st.markdown("**Objective 1 — Energy sovereignty framing**")
-                    sp = st.radio("Keberadaan konsep sovereignty", SOV_PRESENCE, horizontal=True)
-                    sf = st.radio("Kategori framing", SOV_FRAMES)
-                    ks = st.selectbox("Subkode 'ketahanan energi' (jika istilah ini yang dipakai)", KETAHANAN_SENSE)
-                    st.markdown("**Objective 2 — Cost of delayed transition**")
-                    cr = st.radio("Recognition", COD_RECOGNITION, horizontal=True)
-                    cdir = st.radio("Direction of cost narrative", COD_DIRECTION)
-                    ct = st.multiselect("Jenis biaya / risiko yang disebut", COST_TYPES)
-                    ev = st.text_area("Evidence excerpt (kutipan pendek, maks ±2 kalimat)",
-                                      help="Simpan kutipan pendek saja, bukan seluruh artikel.")
-                    nt = st.text_area("Notes / kasus ambigu untuk dibahas di kalibrasi")
-                    submitted = st.form_submit_button("Simpan coding", type="primary")
-                    if submitted:
-                        if not coder_name:
-                            st.error("Isi nama coder di sidebar.")
-                        elif not ev.strip():
-                            st.error("Evidence excerpt wajib diisi (audit trail).")
-                        else:
-                            with get_conn() as c:
-                                c.execute("""INSERT INTO codings
-                                    (doc_id, coder, coded_at, codebook_version, sov_frame, sov_presence,
-                                     ketahanan_sense, cod_recognition, cod_direction, cost_types,
-                                     evidence_excerpt, notes, is_double_coding)
-                                    VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)""",
-                                    (int(cid), coder_name, datetime.now().isoformat(timespec="seconds"),
-                                     CODEBOOK_VERSION, sf, sp, ks, cr, cdir, json.dumps(ct, ensure_ascii=False),
-                                     ev.strip(), nt.strip(), 1 if len(prev) else 0))
-                            log_action(coder_name, "code", f"doc_id={cid}")
-                            st.success("Coding tersimpan.")
+    coded_ids = set(cds["doc_id"]) if len(cds) else set()
+    todo = inc[~inc["id"].isin(coded_ids)].sort_values("id")
 
-# ================================================================ DASHBOARD
-with tab_dash:
-    st.subheader("Metrics")
-    cds = codings_df()
-    if cds.empty:
-        st.info("Belum ada coding.")
+    if len(inc) == 0:
+        st.info("Belum ada dokumen yang lolos saringan. Selesaikan langkah 2 dulu.")
+    elif len(todo) == 0:
+        st.success("Semua dokumen sudah ditandai. Lihat hasilnya di langkah 4.")
+    elif not coder_name:
+        st.warning("Isi nama Anda di panel kiri dulu.")
     else:
-        # satu baris per dokumen: pakai coding pertama (primary); double-coding hanya untuk reliability
+        st.caption(f"Sisa {len(todo)} dokumen untuk dibaca & ditandai.")
+        r = todo.iloc[0]
+        st.markdown(f"#### {r['title']}")
+        st.markdown(f"<span class='muted'>{r['source'] or '—'} · {r['actor_group']} · {r['pub_date'] or '—'}</span>",
+                    unsafe_allow_html=True)
+        if r["url"] and str(r["url"]) != "nan":
+            st.markdown(f"[Buka & baca artikel →]({r['url']})")
+        st.divider()
+
+        with st.form("code_form", clear_on_submit=True):
+            st.markdown("**1. Soal kedaulatan energi — arah cerita ke mana?**")
+            sf = st.radio("framing", SOV_FRAMES, label_visibility="collapsed",
+                          captions=["Kedaulatan = energi bersih / kurangi fosil",
+                                    "Kedaulatan = perkuat fosil domestik",
+                                    "Dua-duanya / saling bertentangan",
+                                    "Disebut tapi tak jelas arahnya"])
+            sp = st.radio("Istilah kedaulatan/kemandirian disebut langsung?", SOV_PRESENCE,
+                          horizontal=True,
+                          captions=["Pakai kata itu", "Maknanya ada, katanya tidak", "Tidak dibahas"])
+            with st.expander("Catatan khusus 'ketahanan energi' (bila istilah itu yang dipakai)"):
+                ks = st.selectbox("Maksudnya", KETAHANAN_SENSE, label_visibility="collapsed")
+
+            st.markdown("**2. Biaya kalau transisi ditunda — diakui atau tidak?**")
+            cr = st.radio("recog", COD_RECOGNITION, horizontal=True, label_visibility="collapsed",
+                          captions=["Disebut tegas", "Tersirat", "Tidak ada"])
+            cdir = st.radio("Cerita soal biaya lebih menekankan apa?", COD_DIRECTION,
+                            captions=["Rugi kalau transisi lambat",
+                                      "Beban transisi (tarif, PHK, investasi)",
+                                      "Dua-duanya", "Tak ada bahasan biaya"])
+            ct = st.multiselect("Jenis biaya/risiko yang disebut (boleh lebih dari satu)", COST_TYPES)
+
+            st.markdown("**3. Bukti**")
+            ev = st.text_area("Kutipan pendek dari artikel (maks ~2 kalimat) sebagai bukti",
+                              placeholder="Salin 1–2 kalimat kunci dari artikel...")
+            note = st.text_input("Catatan (opsional) — bila ragu, tulis di sini untuk dibahas nanti")
+
+            if st.form_submit_button("Simpan & lanjut ke berikutnya", type="primary"):
+                if not ev.strip():
+                    st.error("Kutipan bukti wajib diisi.")
+                else:
+                    with get_conn() as c:
+                        c.execute("""INSERT INTO codings
+                            (doc_id, coder, coded_at, codebook_version, sov_frame, sov_presence,
+                             ketahanan_sense, cod_recognition, cod_direction, cost_types,
+                             evidence_excerpt, notes, is_double_coding)
+                            VALUES (?,?,?,?,?,?,?,?,?,?,?,?,0)""",
+                            (int(r["id"]), coder_name, datetime.now().isoformat(timespec="seconds"),
+                             CODEBOOK_VERSION, sf, sp, ks, cr, cdir, json.dumps(ct, ensure_ascii=False),
+                             ev.strip(), note.strip()))
+                    log_action(coder_name, "code", f"doc_id={r['id']}")
+                    st.rerun()
+
+# ============================================================ 4. DASHBOARD
+elif page == "dash":
+    st.header("Langkah 4 — Hasil")
+    if len(cds) == 0:
+        st.info("Belum ada dokumen yang ditandai. Kembali ke langkah 3.")
+    else:
         primary = cds.sort_values("coded_at").groupby("doc_id", as_index=False).first()
         primary["month"] = pd.to_datetime(primary["pub_date"], errors="coerce").dt.to_period("M").astype(str)
 
-        c1, c2, c3 = st.columns(3)
-        c1.metric("Dokumen dikoding", len(primary))
-        c2.metric("Sovereignty explicit",
-                  f"{(primary['sov_presence']=='Explicit').mean():.0%}")
-        c3.metric("Mengenali cost of delay (expl+impl)",
+        m1, m2, m3 = st.columns(3)
+        m1.metric("Dokumen ditandai", len(primary))
+        m2.metric("Kedaulatan disebut tegas", f"{(primary['sov_presence']=='Explicit').mean():.0%}")
+        m3.metric("Akui biaya penundaan",
                   f"{(primary['cod_recognition'].isin(['Explicit','Implicit'])).mean():.0%}")
 
-        st.markdown("#### Jumlah dokumen per bulan × actor group")
+        st.markdown("#### Dokumen per bulan × kelompok aktor")
         pv = primary.pivot_table(index="month", columns="actor_group", values="doc_id",
                                  aggfunc="count", fill_value=0)
         st.bar_chart(pv)
 
         small = [g for g in EXTENDED_STRATA if (primary["actor_group"] == g).sum() < 30]
         if small:
-            st.warning(f"Strata dengan n < 30: {', '.join(small)}. Proporsi equal-weighted untuk strata "
-                       "kecil sangat noisy — laporkan n per strata dan interval kepercayaan, jangan hanya angka gabungan.")
+            st.info(f"Kelompok dengan data < 30 dokumen: {', '.join(small)}. Angka gabungannya masih goyah — "
+                    "sertakan jumlah per kelompok saat melapor.", icon="ℹ️")
 
-        st.caption("Dua skema bobot ditampilkan berdampingan: **(A) 4 strata setara** — Public, Media, "
-                   "Stakeholder, NGO-CSO/Ahli masing-masing 1/4 — dan **(B) NGO-CSO digabung ke Public** "
-                   "— kembali ke bobot 3 strata seperti desain semula, dengan NGO-CSO/Ahli dihitung sebagai "
-                   "bagian dari suara publik/pakar.")
         primary_merged = merge_ngo_into_public(primary)
 
-        def show_two_schemes(var, categories, header):
+        def two_schemes(var, cats, header):
             st.markdown(f"#### {header}")
             cA, cB = st.columns(2)
             with cA:
-                st.caption("Skema A — 4 strata setara")
-                dA = strata_distribution(primary, var, categories, groups=EXTENDED_STRATA)
-                rowsA = [{"Strata": f"{g} (n={v['n']})", "Kategori": cat, "Proporsi": round(p, 3)}
-                        for g, v in dA.items() for cat, p in v["props"].items()]
-                st.dataframe(pd.DataFrame(rowsA).pivot(index="Kategori", columns="Strata", values="Proporsi"),
-                             use_container_width=True)
+                st.caption("A — 4 kelompok setara")
+                dA = strata_distribution(primary, var, cats, groups=EXTENDED_STRATA)
+                rows = [{"Kategori": c, f"{g} (n={v['n']})": round(v["props"][c], 3)}
+                        for g, v in dA.items() for c in cats]
+                st.dataframe(pd.DataFrame([{**{"Kategori": c},
+                              **{f"{g} (n={dA[g]['n']})": round(dA[g]['props'][c], 3) for g in dA}}
+                              for c in cats]).set_index("Kategori"), use_container_width=True)
             with cB:
-                st.caption("Skema B — NGO-CSO digabung ke Public (3 strata)")
-                dB = strata_distribution(primary_merged, var, categories, groups=CORE_STRATA)
-                rowsB = [{"Strata": f"{g} (n={v['n']})", "Kategori": cat, "Proporsi": round(p, 3)}
-                        for g, v in dB.items() for cat, p in v["props"].items()]
-                st.dataframe(pd.DataFrame(rowsB).pivot(index="Kategori", columns="Strata", values="Proporsi"),
-                             use_container_width=True)
+                st.caption("B — NGO digabung ke Publik (3 kelompok)")
+                dB = strata_distribution(primary_merged, var, cats, groups=CORE_STRATA)
+                st.dataframe(pd.DataFrame([{**{"Kategori": c},
+                              **{f"{g} (n={dB[g]['n']})": round(dB[g]['props'][c], 3) for g in dB}}
+                              for c in cats]).set_index("Kategori"), use_container_width=True)
 
-        show_two_schemes("sov_frame", SOV_FRAMES, "Objective 1 — distribusi framing sovereignty per strata")
-        show_two_schemes("cod_direction", COD_DIRECTION, "Objective 2 — direction of cost narrative per strata")
+        two_schemes("sov_frame", SOV_FRAMES, "Framing kedaulatan energi per kelompok")
+        two_schemes("cod_direction", COD_DIRECTION, "Arah cerita biaya per kelompok")
 
         st.markdown("#### Jenis biaya paling sering disebut")
-        all_costs = []
+        costs = []
         for x in primary["cost_types"].dropna():
-            try:
-                all_costs += json.loads(x)
-            except Exception:
-                pass
-        if all_costs:
-            st.bar_chart(pd.Series(all_costs).value_counts())
+            try: costs += json.loads(x)
+            except Exception: pass
+        if costs:
+            st.bar_chart(pd.Series(costs).value_counts())
 
-        st.markdown("#### Proporsi kunci + Wilson 95% CI")
-        key_rows = []
-        for label, mask in [
-            ("Sovereignty explicit", primary["sov_presence"] == "Explicit"),
-            ("Clean-transition framing", primary["sov_frame"] == SOV_FRAMES[0]),
-            ("Fossil-expansion framing", primary["sov_frame"] == SOV_FRAMES[1]),
-            ("Cost-of-delay recognized (expl+impl)",
-             primary["cod_recognition"].isin(["Explicit", "Implicit"])),
-        ]:
+        st.markdown("#### Proporsi kunci (dengan rentang ketidakpastian 95%)")
+        rows = []
+        for lab, mask in [("Kedaulatan disebut tegas", primary["sov_presence"] == "Explicit"),
+                          ("Framing energi bersih", primary["sov_frame"] == SOV_FRAMES[0]),
+                          ("Framing perluasan fosil", primary["sov_frame"] == SOV_FRAMES[1]),
+                          ("Akui biaya penundaan", primary["cod_recognition"].isin(["Explicit", "Implicit"]))]:
             p, lo, hi = wilson_ci(int(mask.sum()), len(primary))
-            key_rows.append({"Indikator": label, "k/n": f"{int(mask.sum())}/{len(primary)}",
-                             "Proporsi": f"{p:.1%}", "95% CI": f"[{lo:.1%}, {hi:.1%}]"})
-        st.dataframe(pd.DataFrame(key_rows), use_container_width=True, hide_index=True)
+            rows.append({"Indikator": lab, "Proporsi": f"{p:.0%}", "Rentang 95%": f"{lo:.0%}–{hi:.0%}"})
+        st.dataframe(pd.DataFrame(rows), use_container_width=True, hide_index=True)
 
-# ================================================================ RELIABILITY
-with tab_rel:
-    st.subheader("Intercoder reliability (dokumen dengan ≥2 coding)")
-    cds = codings_df()
-    multi = cds.groupby("doc_id").filter(lambda g: g["coder"].nunique() >= 2) if len(cds) else pd.DataFrame()
-    if multi.empty:
-        st.info("Belum ada dokumen yang di-double-code oleh ≥2 coder berbeda. "
-                "Target pilot: 50–100 dokumen, double-code 15–20% terstratifikasi per actor group.")
-    else:
-        n_units = multi["doc_id"].nunique()
-        st.caption(f"{n_units} dokumen double-coded.")
-        results = []
-        for var, label in [("sov_frame", "Sovereignty framing"),
-                           ("sov_presence", "Sovereignty presence"),
-                           ("cod_recognition", "Cost-of-delay recognition"),
-                           ("cod_direction", "Cost direction")]:
-            units = [g[var].tolist() for _, g in multi.groupby("doc_id")]
-            alpha = krippendorff_alpha_nominal(units)
-            agree = sum(1 for u in units if len(set(u)) == 1) / len(units)
-            verdict = ("✅ baik (≥0.80)" if alpha is not None and alpha >= 0.80 else
-                       "🟡 dapat diterima (0.667–0.80)" if alpha is not None and alpha >= 0.667 else
-                       "🔴 revisi codebook (<0.667)")
-            results.append({"Variabel": label, "Krippendorff α": f"{alpha:.3f}" if alpha is not None else "-",
-                            "% full agreement": f"{agree:.0%}", "Interpretasi": verdict})
-        st.dataframe(pd.DataFrame(results), use_container_width=True, hide_index=True)
-        st.markdown("#### Dokumen dengan disagreement (bahas di sesi kalibrasi)")
-        dis = []
-        for doc_id, g in multi.groupby("doc_id"):
-            for var in ["sov_frame", "cod_direction"]:
-                if g[var].nunique() > 1:
-                    dis.append({"doc_id": doc_id, "title": g["title"].iloc[0], "variabel": var,
-                                "nilai": " | ".join(f"{c}: {v}" for c, v in zip(g["coder"], g[var]))})
-        if dis:
-            st.dataframe(pd.DataFrame(dis), use_container_width=True, hide_index=True)
+# ============================================================ MORE (audit + reliability + export)
+elif page == "more":
+    st.header("Lainnya")
+    t1, t2, t3 = st.tabs(["Keandalan antar-coder", "Ekspor data", "Riwayat (audit)"])
+
+    with t1:
+        st.markdown("Untuk cek apakah dua coder menilai dokumen yang sama secara konsisten. "
+                    "Butuh dokumen yang dinilai ≥2 orang.")
+        multi = cds.groupby("doc_id").filter(lambda g: g["coder"].nunique() >= 2) if len(cds) else pd.DataFrame()
+        if multi.empty:
+            st.info("Belum ada dokumen yang dinilai 2 coder berbeda. Target: 15–20% dari sampel, "
+                    "dinilai ulang oleh orang kedua secara independen.")
         else:
-            st.success("Tidak ada disagreement pada variabel utama.")
+            res = []
+            for var, lab in [("sov_frame", "Framing kedaulatan"), ("sov_presence", "Penyebutan kedaulatan"),
+                             ("cod_recognition", "Pengakuan biaya"), ("cod_direction", "Arah biaya")]:
+                units = [g[var].tolist() for _, g in multi.groupby("doc_id")]
+                a = krippendorff_alpha_nominal(units)
+                agree = sum(1 for u in units if len(set(u)) == 1) / len(units)
+                verdict = "baik" if a and a >= 0.80 else "cukup" if a and a >= 0.667 else "perlu perbaikan"
+                res.append({"Variabel": lab, "Skor α": f"{a:.2f}" if a is not None else "—",
+                            "Sepakat penuh": f"{agree:.0%}", "Nilai": verdict})
+            st.dataframe(pd.DataFrame(res), use_container_width=True, hide_index=True)
 
-# ================================================================ EXPORT
-with tab_export:
-    st.subheader("Export & audit trail")
-    d = docs_df(); cds = codings_df()
-    with get_conn() as c:
-        audit = pd.read_sql_query("SELECT * FROM audit_log ORDER BY ts DESC", c)
-    colx, coly, colz = st.columns(3)
-    colx.download_button("⬇ documents.csv", d.to_csv(index=False).encode("utf-8-sig"),
-                         "documents.csv", "text/csv")
-    coly.download_button("⬇ codings.csv", cds.to_csv(index=False).encode("utf-8-sig"),
-                         "codings.csv", "text/csv")
-    colz.download_button("⬇ audit_log.csv", audit.to_csv(index=False).encode("utf-8-sig"),
-                         "audit_log.csv", "text/csv")
-    st.dataframe(audit.head(200), use_container_width=True, height=300)
-    st.caption("Backup penuh: salin file media_screening.db. Codings.csv bisa dianalisis lanjutan "
-               "di notebook Colab (analysis_colab.ipynb).")
+    with t2:
+        d2 = docs_df(); c2 = codings_df()
+        with get_conn() as c:
+            audit = pd.read_sql_query("SELECT * FROM audit_log ORDER BY ts DESC", c)
+        x, y, z = st.columns(3)
+        x.download_button("⬇ Dokumen", d2.to_csv(index=False).encode("utf-8-sig"), "documents.csv")
+        y.download_button("⬇ Hasil coding", c2.to_csv(index=False).encode("utf-8-sig"), "codings.csv")
+        z.download_button("⬇ Riwayat", audit.to_csv(index=False).encode("utf-8-sig"), "audit_log.csv")
+        st.caption("Backup penuh: salin file media_screening.db.")
+
+    with t3:
+        with get_conn() as c:
+            audit = pd.read_sql_query("SELECT ts, actor, action, detail FROM audit_log ORDER BY ts DESC LIMIT 100", c)
+        st.dataframe(audit, use_container_width=True, height=360, hide_index=True)
