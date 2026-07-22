@@ -278,6 +278,72 @@ def _empty(v):
     return v is None or (isinstance(v, float) and pd.isna(v)) or str(v).strip() in ("", "nan", "Auto (dari URL/judul)")
 
 
+def find_duplicate_groups():
+    """Kelompokkan dokumen yang saling duplikat (URL kanonik sama, atau judul ≥0.90 mirip).
+    Return list of groups; tiap group = list of row dicts, diurutkan id menaik (yang tertua dulu)."""
+    with get_conn() as c:
+        rows = c.execute("SELECT id, title, url, url_canonical, source, pub_date, status "
+                         "FROM documents ORDER BY id").fetchall()
+    docs = [dict(id=r[0], title=r[1], url=r[2], canon=r[3], source=r[4],
+                 pub_date=r[5], status=r[6]) for r in rows]
+    parent = {doc["id"]: doc["id"] for doc in docs}
+
+    def find(x):
+        while parent[x] != x:
+            parent[x] = parent[parent[x]]
+            x = parent[x]
+        return x
+
+    def union(a, b):
+        parent[find(a)] = find(b)
+
+    n = len(docs)
+    for i in range(n):
+        for j in range(i + 1, n):
+            a, b = docs[i], docs[j]
+            same_url = a["canon"] and b["canon"] and a["canon"] == b["canon"]
+            same_title = (norm_title(a["title"]) and
+                          SequenceMatcher(None, norm_title(a["title"]), norm_title(b["title"])).ratio() >= 0.90)
+            if same_url or same_title:
+                union(a["id"], b["id"])
+
+    groups_map = {}
+    by_id = {doc["id"]: doc for doc in docs}
+    for doc in docs:
+        root = find(doc["id"])
+        groups_map.setdefault(root, []).append(doc)
+    # hanya kelompok dengan >1 anggota = benar-benar ada duplikat
+    return [sorted(g, key=lambda x: x["id"]) for g in groups_map.values() if len(g) > 1]
+
+
+def delete_documents(ids, actor="system"):
+    """Hapus dokumen berdasarkan id. Aman: hanya hapus dokumen yang BELUM dikoding
+    (menjaga integritas — dokumen yang sudah punya coding tidak dihapus)."""
+    if not ids:
+        return 0, 0
+    deleted, skipped = 0, 0
+    with get_conn() as c:
+        for did in ids:
+            has_coding = c.execute("SELECT COUNT(*) FROM codings WHERE doc_id=?", (did,)).fetchone()[0]
+            if has_coding:
+                skipped += 1
+                continue
+            c.execute("DELETE FROM documents WHERE id=?", (did,))
+            deleted += 1
+    log_action(actor, "delete_duplicates", f"deleted={deleted} skipped_coded={skipped}")
+    return deleted, skipped
+
+
+def reset_all(actor="system"):
+    """Kosongkan seluruh data (documents + codings + audit). Tidak bisa dibatalkan."""
+    with get_conn() as c:
+        c.execute("DELETE FROM codings")
+        c.execute("DELETE FROM documents")
+        c.execute("DELETE FROM audit_log")
+    # catat setelah dikosongkan supaya jadi baris pertama riwayat baru
+    log_action(actor, "RESET_ALL", "seluruh data dikosongkan")
+
+
 def add_document(row, actor="system"):
     dups = find_duplicates(row.get("title"), row.get("url"))
     ag, dt, rule = row.get("actor_group"), row.get("doc_type"), None
@@ -520,15 +586,31 @@ if page == "import":
                 for tgt in ["title", "url", "pub_date", "source", "doc_type", "actor_group", "query_used"]:
                     mapping[tgt] = st.selectbox(tgt, ["(kosong)"] + cols, index=guess(tgt), key=f"map_{tgt}")
             method = st.selectbox("Sumber data ini dari mana?", SEARCH_METHODS, index=1)
+            skip_existing = st.checkbox("Lewati dokumen yang link-nya sudah ada di sistem "
+                                        "(cegah dobel kalau tak sengaja import 2×)", value=True)
             if st.button("Masukkan ke sistem", type="primary"):
-                added, dup = 0, 0
+                existing = set()
+                if skip_existing:
+                    with get_conn() as c:
+                        existing = {row[0] for row in c.execute(
+                            "SELECT url_canonical FROM documents WHERE url_canonical != ''").fetchall()}
+                added, dup, skipped = 0, 0, 0
                 for _, r in imp.iterrows():
                     row = {t: (r[mapping[t]] if mapping[t] != "(kosong)" else None) for t in mapping}
+                    if skip_existing and canonical_url(row.get("url")) in existing:
+                        skipped += 1
+                        continue
                     row["search_method"] = method
                     _, dups = add_document(row, actor=coder_name)
                     added += 1; dup += 1 if dups else 0
-                st.success(f"{added} dokumen masuk. {dup} kemungkinan duplikat ditandai untuk dicek.")
-                st.balloons()
+                msg = f"{added} dokumen masuk."
+                if skipped:
+                    msg += f" {skipped} dilewati karena sudah ada di sistem."
+                if dup:
+                    msg += f" {dup} kemungkinan kembar dengan dokumen lain — cek di tab Bersihkan data."
+                st.success(msg)
+                if added:
+                    st.balloons()
 
         st.divider()
         with st.expander("Atau tambah satu dokumen manual (mis. dari media langganan)"):
@@ -742,7 +824,67 @@ elif page == "dash":
 # ============================================================ MORE (audit + reliability + export)
 elif page == "more":
     st.header("Lainnya")
-    t1, t2, t3 = st.tabs(["Keandalan antar-coder", "Ekspor data", "Riwayat (audit)"])
+    tc, t1, t2, t3 = st.tabs(["🧹 Bersihkan data", "Keandalan antar-coder", "Ekspor data", "Riwayat (audit)"])
+
+    with tc:
+        st.markdown("### Cek & bersihkan duplikat")
+        st.markdown("Kalau kamu tidak sengaja meng-import file yang sama dua kali, dokumennya jadi dobel. "
+                    "Tombol di bawah mencari dokumen yang benar-benar kembar (link sama, atau judul nyaris sama) "
+                    "dan menyisakan **satu** dari tiap kelompok.")
+
+        dall = docs_df()
+        st.caption(f"Saat ini ada {len(dall)} dokumen di sistem.")
+
+        if st.button("🔍 Cari duplikat", key="scan_dup"):
+            st.session_state["dup_groups"] = find_duplicate_groups()
+
+        if "dup_groups" in st.session_state:
+            groups = st.session_state["dup_groups"]
+            if not groups:
+                st.success("Tidak ada duplikat. Data bersih — langsung lanjut mengerjakan Langkah 2.")
+            else:
+                n_extra = sum(len(g) - 1 for g in groups)
+                st.warning(f"Ditemukan {len(groups)} kelompok kembar, berisi {n_extra} dokumen berlebih "
+                           f"yang bisa dihapus (menyisakan 1 per kelompok).")
+                with st.expander(f"Lihat {len(groups)} kelompok duplikat"):
+                    for gi, g in enumerate(groups[:40], 1):
+                        st.markdown(f"**Kelompok {gi}** — menyimpan #{g[0]['id']}, menghapus "
+                                    f"{', '.join('#'+str(x['id']) for x in g[1:])}")
+                        for x in g:
+                            keep = "✅ simpan" if x["id"] == g[0]["id"] else "🗑 hapus"
+                            st.caption(f"{keep} · #{x['id']} · {str(x['title'])[:70]} · {x['source'] or '—'}")
+                    if len(groups) > 40:
+                        st.caption(f"...dan {len(groups)-40} kelompok lain.")
+
+                st.info("Yang dihapus hanya salinan berlebih yang **belum kamu tandai** di Langkah 3. "
+                        "Kalau ada salinan yang sudah terlanjur dikoding, itu tidak dihapus (biar hasil kerjamu aman).")
+                if st.button("🗑 Hapus duplikat berlebih sekarang", type="primary", key="do_dedup",
+                             disabled=not coder_name):
+                    to_delete = [x["id"] for g in groups for x in g[1:]]
+                    deleted, skipped = delete_documents(to_delete, actor=coder_name or "system")
+                    msg = f"{deleted} duplikat dihapus."
+                    if skipped:
+                        msg += f" {skipped} tidak dihapus karena sudah dikoding."
+                    st.success(msg)
+                    del st.session_state["dup_groups"]
+                    st.rerun()
+                if not coder_name:
+                    st.caption("Isi nama di panel kiri untuk mengaktifkan tombol hapus.")
+
+        st.divider()
+        st.markdown("### Mulai dari nol (reset)")
+        st.markdown("Menghapus **semua** dokumen, hasil coding, dan riwayat. Pakai ini kalau mau import ulang "
+                    "dari awal yang bersih. Tidak bisa dibatalkan — pastikan sudah ekspor/backup dulu bila perlu.")
+        with st.expander("Buka opsi reset (hati-hati)"):
+            confirm = st.text_input('Ketik persis kata **HAPUS** untuk mengonfirmasi', key="reset_confirm")
+            if st.button("Reset semua data", type="secondary", key="do_reset",
+                         disabled=(confirm != "HAPUS" or not coder_name)):
+                reset_all(actor=coder_name or "system")
+                st.session_state.pop("dup_groups", None)
+                st.success("Semua data dikosongkan. Silakan mulai lagi dari Langkah 1.")
+                st.rerun()
+            if confirm != "HAPUS":
+                st.caption("Tombol aktif setelah kamu mengetik HAPUS (huruf besar).")
 
     with t1:
         st.markdown("Untuk cek apakah dua coder menilai dokumen yang sama secara konsisten. "
